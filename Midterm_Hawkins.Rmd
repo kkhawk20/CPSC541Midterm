@@ -1,0 +1,199 @@
+---
+title: "Midterm_Hawkins"
+output: pdf_document
+---
+
+```{r setup, include = FALSE}
+# Helper packages
+
+library(rsample)   # for creating our train-test splits
+library(recipes)   # for minor feature engineering tasks
+library(dplyr)    # for data manipulation
+library(ggplot2)  # for data visualization
+library(tidyr)    # for data reshaping
+# Modeling packages
+library(h2o)       # for fitting stacked models
+h2o.no_progress()  # turn off progress bars
+h2o.init(max_mem_size = "5g")  # connect to H2O instance
+
+# Load and split the Ames housing data
+ames <- AmesHousing::make_ames()
+set.seed(123)  # for reproducibility
+split <- initial_split(ames, strata = "Sale_Price")
+ames_train <- training(split)
+ames_test <- testing(split)
+
+# Make sure we have consistent categorical levels
+blueprint <- recipe(Sale_Price ~ ., data = ames_train) %>%
+  step_other(all_nominal(), threshold = 0.005)
+
+# Create training & test sets for h2o
+train_h2o <- prep(blueprint, training = ames_train, retain = TRUE) %>%
+  juice() %>%
+  as.h2o()
+test_h2o <- prep(blueprint, training = ames_train) %>%
+  bake(new_data = ames_test) %>%
+  as.h2o()
+
+# Get response and feature names
+Y <- "Sale_Price"
+X <- setdiff(names(ames_train), Y)
+
+```
+
+## Stacking existing models (This takes 60+ minutes to run)
+```{r 15.3, echo = FALSE, warning=FALSE}
+# Train & cross-validate a GLM model
+best_glm <- h2o.glm(
+  x = X, y = Y, training_frame = train_h2o, alpha = 0.1,
+  remove_collinear_columns = TRUE, nfolds = 2, fold_assignment = "Modulo",
+  keep_cross_validation_predictions = TRUE, seed = 123
+)
+
+# Train & cross-validate a RF model
+best_rf <- h2o.randomForest(
+  x = X, y = Y, training_frame = train_h2o, ntrees = 100, mtries = -1,
+  max_depth = 15, min_rows = 1, sample_rate = 0.8, nfolds = 2,
+  fold_assignment = "Modulo", keep_cross_validation_predictions = TRUE,
+  seed = 123, stopping_rounds = 50, stopping_metric = "RMSE",
+  stopping_tolerance = 0
+)
+
+# Train & cross-validate a GBM model
+best_gbm <- h2o.gbm(
+  x = X, y = Y, training_frame = train_h2o, ntrees = 500, learn_rate = 0.01,
+  max_depth = 7, min_rows = 5, sample_rate = 0.8, nfolds = 2,
+  fold_assignment = "Modulo", keep_cross_validation_predictions = TRUE,
+  seed = 123, stopping_rounds = 50, stopping_metric = "RMSE",
+  stopping_tolerance = 0
+)
+
+# Train & cross-validate an XGBoost model
+best_xgb <- h2o.xgboost(
+  x = X, y = Y, training_frame = train_h2o, ntrees = 5000, learn_rate = 0.05,
+  max_depth = 3, min_rows = 3, sample_rate = 0.8, categorical_encoding = "LabelEncoder",
+  nfolds = 2, fold_assignment = "Modulo", 
+  keep_cross_validation_predictions = TRUE, seed = 123, stopping_rounds = 50,
+  stopping_metric = "RMSE", stopping_tolerance = 0
+)
+
+# Train a stacked tree ensemble
+ensemble_tree <- h2o.stackedEnsemble(
+  x = X, y = Y, training_frame = train_h2o, model_id = "my_tree_ensemble",
+  base_models = list(best_glm, best_rf, best_gbm, best_xgb),
+  metalearner_algorithm = "drf"
+)
+
+# Get results from base learners
+get_rmse <- function(model) {
+  results <- h2o.performance(model, newdata = test_h2o)
+  results@metrics$RMSE
+}
+list(best_glm, best_rf, best_gbm, best_xgb) %>%
+  purrr::map_dbl(get_rmse)
+## [1] 30024.67 23075.24 20859.92 21391.20
+
+# Stacked results
+h2o.performance(ensemble_tree, newdata = test_h2o)@metrics$RMSE
+## [1] 20664.56
+
+data.frame(
+  GLM_pred = as.vector(h2o.getFrame(best_glm@model$cross_validation_holdout_predictions_frame_id$name)),
+  RF_pred = as.vector(h2o.getFrame(best_rf@model$cross_validation_holdout_predictions_frame_id$name)),
+  GBM_pred = as.vector(h2o.getFrame(best_gbm@model$cross_validation_holdout_predictions_frame_id$name)),
+  XGB_pred = as.vector(h2o.getFrame(best_xgb@model$cross_validation_holdout_predictions_frame_id$name))
+) %>% cor()
+```
+### Detailed Learning Points:
+- XGBoost performs best among base learners. It has a RMSE of 19,968.97, its the top-performing model on the test set. It shows teh XGBoost strength in handling structured/tabular data and capturing complex non-linear relationships with fewer trees due to its boosting nature. 
+- GLM Performs the worst. It has the highest RMSE of 30,018.69. It highlights that linear models can underfit in complex datasets like this housing datasets where non-linear relationships and interactions matter. 
+- Stacked ensemble beats all base models. As expected, the ensemble gets a RMSE of 21,719.78, which outperforms the GLM and nearly matching or slightly lagging behind XGBoost. This indicates weak synergy among models due to strong collinearity. And the metalearner might be slightly overfitting or failing to extract additional signal. 
+- Low fold count likely underestimates variability. Using only 2-fold cross-validation reduces computational cost but can increase variance in holdout estimates and limit the ensemble's robustness. For better meta-learning and generalization we can increase to 5-10 folds. 
+- Early stopping is super effective in tree-based models. Using those stopping parameters ensures the trees stop growing when no furhter gain is made, reducing overfitting and excessive model complexity like in teh XGBoost model. 
+- High correlation among prediction indicates redundancy. The correlation between RF, GBM, and XGBoost predictions is super high. This suggests the models are learning similar patterns which limits the ensemble's gain. We want more diversity maybe. 
+- GLM has the lowest correlation which can still provide value but its lowest. 
+
+## NN as stacked model instead of DRF
+```{r echo = FALSE, warning=FALSE}
+# Train a stacked tree ensemble
+# Train a stacked ensemble using a neural network as the metalearner
+
+ensemble_nn <- h2o.stackedEnsemble(
+  x = X, y = Y, training_frame = train_h2o, model_id = "my_nn_ensemble",
+  base_models = list(best_glm, best_rf, best_gbm, best_xgb),
+  metalearner_algorithm = "deeplearning"
+)
+
+# Get results from base learners
+get_rmse <- function(model) {
+  results <- h2o.performance(model, newdata = test_h2o)
+  results@metrics$RMSE
+}
+list(best_glm, best_rf, best_gbm, best_xgb) %>%
+  purrr::map_dbl(get_rmse)
+
+# Stacked NN ensemble results
+h2o.performance(ensemble_nn, newdata = test_h2o)@metrics$RMSE
+
+# Check correlation of cross-validated predictions
+data.frame(
+  GLM_pred = as.vector(h2o.getFrame(best_glm@model$cross_validation_holdout_predictions_frame_id$name)),
+  RF_pred = as.vector(h2o.getFrame(best_rf@model$cross_validation_holdout_predictions_frame_id$name)),
+  GBM_pred = as.vector(h2o.getFrame(best_gbm@model$cross_validation_holdout_predictions_frame_id$name)),
+  XGB_pred = as.vector(h2o.getFrame(best_xgb@model$cross_validation_holdout_predictions_frame_id$name))
+) %>% cor()
+
+```
+### Detailed Learning Points:
+- Best overall RMSE is the NN Stacked ensemble getting a RMSE of 20,966.74. It does better than all individual models and compared to the previous DRF-stacked model. 
+- The NN learner captures complex interactions between base model outputs and default DRF stack, likely due to its hidden layers allowing better learning
+- Still the same issues with correlation between base learners as denoted in the last analysis section
+- The NN stacked enselble shows that changing the meta-learning algorithm alone can meaningfully improve performance, even when the base learners remain constant. 
+
+### Overall Comparison Between Base and Deep Learning Stacked Models
+```{r}
+
+# Evaluate performance metrics for both ensemble models
+perf_drf <- h2o.performance(ensemble_tree, newdata = test_h2o)
+perf_nn <- h2o.performance(ensemble_nn, newdata = test_h2o)
+
+# Extract key metrics
+compare_metrics <- tibble::tibble(
+  Model = c("Stacked DRF", "Stacked NN"),
+  RMSE = c(h2o.rmse(perf_drf), h2o.rmse(perf_nn)),
+  MAE = c(h2o.mae(perf_drf), h2o.mae(perf_nn)),
+  R2 = c(h2o.r2(perf_drf), h2o.r2(perf_nn))
+)
+
+print(compare_metrics)
+
+# Create performance data
+compare_metrics <- tibble::tibble(
+  Model = c("Stacked DRF", "Stacked NN"),
+  RMSE = c(21203.69, 20966.74),
+  MAE = c(13466.64, 13564.84),
+  R2 = c(0.9312284, 0.9327569)
+)
+
+# Convert data to long format for ggplot
+compare_long <- compare_metrics %>%
+  pivot_longer(cols = -Model, names_to = "Metric", values_to = "Value")
+
+# Create bar plot
+ggplot(compare_long, aes(x = Model, y = Value, fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~ Metric, scales = "free_y") +
+  labs(
+    title = "Model Performance Comparison: Stacked DRF vs Stacked NN",
+    y = "Value",
+    x = "Model"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+- There is a lower RMSE in the stacked NN (by ~237 points) suggesting its better at minimizing large errors - which is crucial when housing prices can vary widely. 
+- MAE is slightly better in the DRF stack (lower by ~98 points), meaning the average error in absolute terms is a bit lower - though the difference is negligible in practice
+- R2 is higher in the NN ensemble (0.9328 vs 0.9312), showing it explains slightly more variance in sale_price. 
+- The stacked NN ensemble model outperforms the DRF stack in generalization and varaince. 
+
